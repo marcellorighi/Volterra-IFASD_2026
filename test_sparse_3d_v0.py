@@ -1,0 +1,1463 @@
+import numpy as np
+import openmdao.api as om
+from scipy.special import eval_laguerre
+import matplotlib.pyplot as plt
+
+# =================
+# sparse algorithms 
+# =================
+
+import time
+
+
+# ════════════════════════════════════════════════════════════════════════
+# STRATEGY 1 — STLSQ WITH MINIMUM NNZ GUARANTEE
+# ════════════════════════════════════════════════════════════════════════
+
+def stlsq_min_nnz(A, y, threshold=0.01, min_nnz=10,
+                   max_iter=20, normalise_cols=True):
+    """
+    STLSQ with a hard lower bound on the number of non-zero coefficients.
+
+    The threshold is applied normally at each iteration, but if the
+    active set would fall below min_nnz, the weakest coefficients are
+    kept until the minimum is satisfied.
+
+    Parameters
+    ----------
+    A             : (n, p)  regressor matrix
+    y             : (n,)    output vector
+    threshold     : float   sparsity threshold on normalised coefficients
+    min_nnz       : int     minimum number of coefficients to keep
+                            set to 0 for standard STLSQ behaviour
+    max_iter      : int
+    normalise_cols: bool
+
+    Returns
+    -------
+    h    : (p,) kernel in physical units
+    info : dict  (method, r2, nnz, n_iter, threshold_used)
+    """
+    n, p = A.shape
+    min_nnz = max(1, min(min_nnz, p))   # clamp to valid range
+
+    if normalise_cols:
+        col_std = A.std(axis=0)
+        col_std[col_std < 1e-14] = 1.0
+        A_fit = A / col_std
+    else:
+        A_fit = A
+        col_std = np.ones(p)
+
+    h_norm = np.linalg.lstsq(A_fit, y, rcond=None)[0]
+    active = np.ones(p, dtype=bool)
+    n_iter = 0
+
+    for it in range(max_iter):
+        n_iter = it + 1
+
+        # standard threshold
+        small  = np.abs(h_norm) < threshold
+        n_keep = int(active.sum()) - int(small.sum())
+
+        if n_keep < min_nnz:
+            # not enough coefficients survive — keep the min_nnz largest
+            abs_h   = np.abs(h_norm)
+            abs_h[~active] = 0.0           # only among currently active
+            cutoff_idx = np.argsort(abs_h)[::-1][:min_nnz]
+            small      = np.ones(p, dtype=bool)
+            small[cutoff_idx] = False
+            print(f"  [iter {it+1}] min_nnz={min_nnz} active, "
+                  f"threshold relaxed to keep {min_nnz} terms")
+
+        h_norm[small] = 0.0
+        active        = ~small
+
+        h_new = np.zeros(p)
+        h_new[active] = np.linalg.lstsq(A_fit[:, active], y, rcond=None)[0]
+
+        # convergence: active set unchanged
+        if np.array_equal(active, np.abs(h_new) >= threshold):
+            h_norm = h_new
+            break
+        h_norm = h_new
+
+    h      = h_norm / col_std
+    y_pred = A @ h
+    r2     = _r2(y, y_pred)
+
+    info = dict(method='stlsq_min_nnz', threshold=threshold,
+                min_nnz=min_nnz, r2=r2,
+                nnz=int(np.sum(h != 0)), n_iter=n_iter,
+                y_pred=y_pred)
+    return h, info
+
+
+# ════════════════════════════════════════════════════════════════════════
+# STRATEGY 2 — STLSQ WITH RELATIVE THRESHOLD
+# ════════════════════════════════════════════════════════════════════════
+
+def stlsq_relative(A, y, rel_threshold=0.05,
+                    max_iter=20, normalise_cols=True):
+    """
+    STLSQ where the threshold is expressed as a FRACTION of the largest
+    normalised coefficient magnitude at each iteration.
+
+        threshold_k = rel_threshold * max(|h_norm|)
+
+    This is more robust than an absolute threshold when you do not know
+    the typical scale of your kernel coefficients in advance.
+    Directly analogous to your Volterra rho criterion:
+    rel_threshold=0.05 keeps all terms contributing more than 5% of
+    the dominant term.
+
+    Parameters
+    ----------
+    A             : (n, p)
+    y             : (n,)
+    rel_threshold : float   fraction of max|h_norm| below which to zero
+                            typical range: 0.01 – 0.10
+    """
+    n, p = A.shape
+
+    if normalise_cols:
+        col_std = A.std(axis=0)
+        col_std[col_std < 1e-14] = 1.0
+        A_fit = A / col_std
+    else:
+        A_fit = A
+        col_std = np.ones(p)
+
+    h_norm = np.linalg.lstsq(A_fit, y, rcond=None)[0]
+    active = np.ones(p, dtype=bool)
+    n_iter = 0
+
+    for it in range(max_iter):
+        n_iter    = it + 1
+        threshold = rel_threshold * np.max(np.abs(h_norm))
+        small     = np.abs(h_norm) < threshold
+        h_norm[small] = 0.0
+        active        = ~small
+
+        if not active.any():
+            print("  Warning: all terms zeroed. Lower rel_threshold.")
+            break
+
+        h_new = np.zeros(p)
+        h_new[active] = np.linalg.lstsq(A_fit[:, active], y, rcond=None)[0]
+
+        prev_threshold = rel_threshold * np.max(np.abs(h_norm))
+        if np.array_equal(active, np.abs(h_new) >= prev_threshold):
+            h_norm = h_new
+            break
+        h_norm = h_new
+
+    h      = h_norm / col_std
+    y_pred = A @ h
+    r2     = _r2(y, y_pred)
+
+    info = dict(method='stlsq_relative', rel_threshold=rel_threshold,
+                r2=r2, nnz=int(np.sum(h != 0)), n_iter=n_iter,
+                y_pred=y_pred)
+    return h, info
+
+
+# ════════════════════════════════════════════════════════════════════════
+# STRATEGY 3 — ORTHOGONAL MATCHING PURSUIT  (exact nnz control)
+# ════════════════════════════════════════════════════════════════════════
+
+def solve_omp(A, y, n_nonzero, normalise_cols=True):
+    """
+    Orthogonal Matching Pursuit: greedily selects exactly n_nonzero
+    columns of A that best explain y, then solves OLS on that support.
+
+    This gives you EXACT control over the number of non-zero
+    kernel coefficients — the most direct answer to "I want exactly
+    k terms in my kernel".
+
+    Parameters
+    ----------
+    A          : (n, p)
+    y          : (n,)
+    n_nonzero  : int    exact number of non-zero coefficients desired
+
+    Returns
+    -------
+    h    : (p,) sparse kernel
+    info : dict (method, r2, nnz, support)
+    """
+    from sklearn.linear_model import OrthogonalMatchingPursuit
+
+    n, p = A.shape
+    n_nonzero = min(n_nonzero, p)
+
+    if normalise_cols:
+        col_std = A.std(axis=0)
+        col_std[col_std < 1e-14] = 1.0
+        A_fit = A / col_std
+    else:
+        A_fit = A
+        col_std = np.ones(p)
+
+    model = OrthogonalMatchingPursuit(n_nonzero_coefs=n_nonzero,
+                                      fit_intercept=False)
+    model.fit(A_fit, y)
+    h_norm = model.coef_
+    h      = h_norm / col_std
+
+    y_pred  = A @ h
+    r2      = _r2(y, y_pred)
+    support = np.where(h != 0)[0]
+
+    info = dict(method='omp', n_nonzero=n_nonzero,
+                r2=r2, nnz=int(np.sum(h != 0)),
+                support=support, y_pred=y_pred)
+    return h, info
+
+
+# ════════════════════════════════════════════════════════════════════════
+# STRATEGY 4 — LASSO PATH: SWEEP ALPHA, STOP AT DESIRED NNZ
+# ════════════════════════════════════════════════════════════════════════
+
+def lasso_path_nnz(A, y, target_nnz, n_alphas=50, normalise_cols=True):
+    """
+    Compute the full LASSO regularisation path and return the solution
+    with the number of non-zero coefficients closest to target_nnz.
+
+    This is useful when you want to say "I expect about k non-zero
+    kernel coefficients" without knowing the right alpha in advance.
+
+    Parameters
+    ----------
+    A          : (n, p)
+    y          : (n,)
+    target_nnz : int    desired number of non-zero coefficients
+    n_alphas   : int    number of alpha values on the path
+
+    Returns
+    -------
+    h          : (p,) kernel at the alpha closest to target_nnz
+    info       : dict (method, alpha_used, r2, nnz, path_nnz, path_r2)
+    """
+    from sklearn.linear_model import lasso_path
+    from sklearn.preprocessing import StandardScaler
+
+    n, p = A.shape
+
+    if normalise_cols:
+        scaler  = StandardScaler(with_mean=False)
+        A_fit   = scaler.fit_transform(A)
+        col_std = scaler.scale_
+    else:
+        A_fit   = A
+        col_std = np.ones(p)
+
+    # compute path: returns (alphas, coefs, _)
+    # coefs shape: (p, n_alphas)
+    alphas, coefs, _ = lasso_path(A_fit, y, n_alphas=n_alphas)
+
+    # for each alpha: count nnz and compute R²
+    path_nnz = np.sum(coefs != 0, axis=0)        # (n_alphas,)
+    path_r2  = np.array([
+        _r2(y, A_fit @ coefs[:, k]) for k in range(n_alphas)
+    ])
+
+    # find alpha where nnz is closest to target
+    best_k    = np.argmin(np.abs(path_nnz - target_nnz))
+    best_alpha = alphas[best_k]
+    h_norm    = coefs[:, best_k]
+    h         = h_norm / col_std
+
+    y_pred = A_fit @ h_norm
+    r2     = _r2(y, y_pred)
+
+    print(f"  LASSO path: target_nnz={target_nnz}  "
+          f"found nnz={path_nnz[best_k]}  alpha={best_alpha:.3e}  R²={r2:.4f}")
+
+    info = dict(method='lasso_path', alpha_used=best_alpha,
+                r2=r2, nnz=int(path_nnz[best_k]),
+                path_nnz=path_nnz, path_r2=path_r2,
+                alphas=alphas, y_pred=A @ h)
+    return h, info
+
+
+# ════════════════════════════════════════════════════════════════════════
+# SPARSITY — R² TRADE-OFF CURVE
+# ════════════════════════════════════════════════════════════════════════
+
+def sparsity_r2_curve(A, y, method='omp', max_nnz=None,
+                       normalise_cols=True, step=1):
+    """
+    Compute the R² as a function of the number of non-zero coefficients.
+    This is the single most useful diagnostic: it tells you where
+    adding more kernel terms stops improving the fit — your "elbow".
+
+    For Volterra kernels: the elbow separates physically meaningful
+    coefficients from noise-fitting ones.
+
+    Parameters
+    ----------
+    A          : (n, p)
+    y          : (n,)
+    method     : 'omp' (recommended) or 'lasso_path'
+    max_nnz    : int   maximum nnz to compute up to (default: min(n,p)//10)
+    step       : int   step size in nnz (use >1 for large p to save time)
+
+    Returns
+    -------
+    nnz_vals : array of nnz values tried
+    r2_vals  : corresponding R² values
+    """
+    n, p = A.shape
+    if max_nnz is None:
+        max_nnz = min(p, max(20, p // 20))
+
+    nnz_range = np.arange(1, max_nnz + 1, step)
+    r2_vals   = np.zeros(len(nnz_range))
+
+    if method == 'omp':
+        if normalise_cols:
+            col_std = A.std(axis=0); col_std[col_std<1e-14]=1.
+            A_fit   = A / col_std
+        else:
+            A_fit = A
+
+        from sklearn.linear_model import OrthogonalMatchingPursuit
+        for i, k in enumerate(nnz_range):
+            omp = OrthogonalMatchingPursuit(
+                n_nonzero_coefs=int(k), fit_intercept=False)
+            omp.fit(A_fit, y)
+            r2_vals[i] = _r2(y, A_fit @ omp.coef_)
+
+    elif method == 'lasso_path':
+        from sklearn.linear_model import lasso_path
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler(with_mean=False)
+        A_fit  = scaler.fit_transform(A) if normalise_cols else A
+        alphas, coefs, _ = lasso_path(A_fit, y, n_alphas=200)
+        path_nnz = np.sum(coefs != 0, axis=0)
+        for i, k in enumerate(nnz_range):
+            idx = np.argmin(np.abs(path_nnz - k))
+            r2_vals[i] = _r2(y, A_fit @ coefs[:, idx])
+
+    return nnz_range, r2_vals
+
+
+# ════════════════════════════════════════════════════════════════════════
+# HELPER
+# ════════════════════════════════════════════════════════════════════════
+
+def _r2(y, y_pred):
+    ss_res = np.sum((y - y_pred)**2)
+    ss_tot = np.sum((y - y.mean())**2) + 1e-14
+    return 1.0 - ss_res / ss_tot
+
+
+# ============================================================================
+# Component 1: Residual Computation
+# ============================================================================
+
+class VoltterraResidualComp(om.ExplicitComponent):
+    """
+    Compute residuals for Volterra kernel identification
+    
+    Residual = A @ h - y
+    """
+    
+    def initialize(self):
+        self.options.declare('A', types=np.ndarray, desc='System matrix')
+        self.options.declare('y', types=np.ndarray, desc='Output vector')
+        self.options.declare('kernel_name', types=str, desc='Name for this kernel (e.g., cl, cm)')
+        self.options.declare('n_coeffs', types=int, desc='Number of kernel coefficients')
+    
+    def setup(self):
+        A = self.options['A']
+        y = self.options['y']
+        kernel_name = self.options['kernel_name']
+        n_coeffs = self.options['n_coeffs']
+        
+        # Design variable: kernel coefficients
+        self.add_input(f'h_{kernel_name}', shape=n_coeffs, desc=f'Kernel coefficients for {kernel_name}')
+        
+        # Output: residual vector
+        self.add_output(f'residual_{kernel_name}', shape=len(y), desc=f'Residual for {kernel_name}')
+        
+        # Declare partials (Jacobian is just A)
+        self.declare_partials(f'residual_{kernel_name}', f'h_{kernel_name}', val=A)
+    
+    def compute(self, inputs, outputs):
+        A = self.options['A']
+        y = self.options['y']
+        kernel_name = self.options['kernel_name']
+        
+        h = inputs[f'h_{kernel_name}']
+        
+        # Compute residual
+        outputs[f'residual_{kernel_name}'] = A @ h - y
+
+
+# ============================================================================
+# Component 2: Regularization Penalty
+# ============================================================================
+
+class RegularizationComp(om.ExplicitComponent):
+    """
+    Compute regularization penalties:
+    - Smoothness (second derivative penalty)
+    - Decay enforcement (exponential penalty on later coefficients)
+    - L2 norm (ridge penalty)
+    """
+    
+    def initialize(self):
+        self.options.declare('kernel_name', types=str)
+        self.options.declare('n_coeffs', types=int)
+        self.options.declare('m', types=int, desc='Memory length per kernel order')
+        self.options.declare('lambda_smooth', default=0.01)
+        self.options.declare('lambda_decay', default=0.1)
+        self.options.declare('lambda_ridge', default=0.001)
+        self.options.declare('decay_rate', default=5.0)
+    
+    def setup(self):
+        kernel_name = self.options['kernel_name']
+        n_coeffs = self.options['n_coeffs']
+        m = self.options['m']
+        
+        self.add_input(f'h_{kernel_name}', shape=n_coeffs)
+        
+        # Outputs: different penalty terms
+        self.add_output(f'smoothness_penalty_{kernel_name}', val=0.0)
+        self.add_output(f'decay_penalty_{kernel_name}', val=0.0)
+        self.add_output(f'ridge_penalty_{kernel_name}', val=0.0)
+        
+        # Build regularization matrices
+        self._build_regularization_matrices()
+        
+        # Declare partials
+        self.declare_partials(f'smoothness_penalty_{kernel_name}', f'h_{kernel_name}')
+        self.declare_partials(f'decay_penalty_{kernel_name}', f'h_{kernel_name}')
+        self.declare_partials(f'ridge_penalty_{kernel_name}', f'h_{kernel_name}')
+    
+    def _build_regularization_matrices(self):
+        """Build D2 (smoothness) and L (decay) matrices"""
+        from scipy.linalg import block_diag
+        
+        m = self.options['m']
+        n_coeffs = self.options['n_coeffs']
+        n_orders = n_coeffs // m  # Number of kernel orders
+        
+        # Second derivative operator for one order
+        D2_single = np.diff(np.eye(m), n=2, axis=0)
+        
+        # Decay penalty for one order
+        decay_rate = self.options['decay_rate']
+        L_single = np.diag(np.exp(decay_rate * np.linspace(0, 1, m)) - 1)
+        
+        # Block diagonal for all orders
+        D2_blocks = [D2_single for _ in range(n_orders)]
+        L_blocks = [L_single for _ in range(n_orders)]
+        
+        self.D2 = block_diag(*D2_blocks)
+        self.L = block_diag(*L_blocks)
+        
+        # Precompute D2^T @ D2 and store
+        self.D2TD2 = self.D2.T @ self.D2
+        
+    def compute(self, inputs, outputs):
+        kernel_name = self.options['kernel_name']
+        lambda_smooth = self.options['lambda_smooth']
+        lambda_decay = self.options['lambda_decay']
+        lambda_ridge = self.options['lambda_ridge']
+        
+        h = inputs[f'h_{kernel_name}']
+        
+        # Smoothness penalty: ||D2 @ h||^2
+        D2h = self.D2 @ h
+        outputs[f'smoothness_penalty_{kernel_name}'] = lambda_smooth * np.dot(D2h, D2h)
+        
+        # Decay penalty: h^T @ L @ h
+        outputs[f'decay_penalty_{kernel_name}'] = lambda_decay * np.dot(h, self.L @ h)
+        
+        # Ridge penalty: ||h||^2
+        outputs[f'ridge_penalty_{kernel_name}'] = lambda_ridge * np.dot(h, h)
+    
+    def compute_partials(self, inputs, partials):
+        kernel_name = self.options['kernel_name']
+        lambda_smooth = self.options['lambda_smooth']
+        lambda_decay = self.options['lambda_decay']
+        lambda_ridge = self.options['lambda_ridge']
+        
+        h = inputs[f'h_{kernel_name}']
+        
+        # Gradient of smoothness penalty: 2 * lambda_smooth * D2^T @ D2 @ h
+        partials[f'smoothness_penalty_{kernel_name}', f'h_{kernel_name}'] = \
+            2 * lambda_smooth * (self.D2TD2 @ h)
+        
+        # Gradient of decay penalty: 2 * lambda_decay * L @ h
+        partials[f'decay_penalty_{kernel_name}', f'h_{kernel_name}'] = \
+            2 * lambda_decay * (self.L @ h)
+        
+        # Gradient of ridge penalty: 2 * lambda_ridge * h
+        partials[f'ridge_penalty_{kernel_name}', f'h_{kernel_name}'] = \
+            2 * lambda_ridge * h
+
+
+# ============================================================================
+# Component 3: Laguerre Basis Transformation (Optional)
+# ============================================================================
+
+class LaguerreTransformComp(om.ExplicitComponent):
+    """
+    Transform Laguerre coefficients to time-domain kernel
+    
+    h(t) = L @ c, where L is Laguerre basis matrix, c are coefficients
+    """
+    
+    def initialize(self):
+        self.options.declare('kernel_name', types=str)
+        self.options.declare('m', types=int, desc='Memory length per order')
+        self.options.declare('n_orders', types=int, desc='Number of kernel orders')
+        self.options.declare('n_basis', default=15, desc='Number of Laguerre functions')
+        self.options.declare('alpha', default=0.7, desc='Laguerre pole (0 < alpha < 1)')
+    
+    def setup(self):
+        kernel_name = self.options['kernel_name']
+        m = self.options['m']
+        n_orders = self.options['n_orders']
+        n_basis = self.options['n_basis']
+        
+        # Input: Laguerre coefficients (much fewer than time-domain coeffs)
+        n_laguerre_coeffs = n_orders * n_basis
+        self.add_input(f'c_{kernel_name}', shape=n_laguerre_coeffs, 
+                      desc='Laguerre coefficients')
+        
+        # Output: time-domain kernel coefficients
+        n_time_coeffs = n_orders * m
+        self.add_output(f'h_{kernel_name}', shape=n_time_coeffs,
+                       desc='Time-domain kernel')
+        
+        # Build Laguerre basis
+        self._build_laguerre_basis()
+        
+        # Jacobian is just the basis matrix
+        self.declare_partials(f'h_{kernel_name}', f'c_{kernel_name}', val=self.L_full)
+    
+    def _build_laguerre_basis(self):
+        """Generate Laguerre basis functions"""
+        from scipy.linalg import block_diag
+        
+        m = self.options['m']
+        n_basis = self.options['n_basis']
+        alpha = self.options['alpha']
+        n_orders = self.options['n_orders']
+        
+        # Create basis for one kernel order
+        t = np.arange(m)
+        L_single = np.zeros((m, n_basis))
+        
+        for n in range(n_basis):
+            # Discrete Laguerre functions
+            L_single[:, n] = (np.sqrt(1 - alpha**2) * (alpha**t) * 
+                             eval_laguerre(n, 2*alpha*t/(1-alpha**2)))
+        
+        # Block diagonal for all orders
+        L_blocks = [L_single for _ in range(n_orders)]
+        self.L_full = block_diag(*L_blocks)
+    
+    def compute(self, inputs, outputs):
+        kernel_name = self.options['kernel_name']
+        
+        c = inputs[f'c_{kernel_name}']
+        outputs[f'h_{kernel_name}'] = self.L_full @ c
+
+
+# ============================================================================
+# Component 4: Objective Function (Sum of Squared Residuals)
+# ============================================================================
+
+class ObjectiveComp(om.ExplicitComponent):
+    """
+    Total objective: sum of residual norms and regularization penalties
+    """
+    
+    def initialize(self):
+        self.options.declare('kernel_names', types=list, desc='List of kernel names (e.g., [cl, cm])')
+        self.options.declare('n_samples', types=int, desc='Number of samples in residual vector')
+    
+    def setup(self):
+        kernel_names = self.options['kernel_names']
+        n_samples = self.options['n_samples']
+        
+        # Inputs: residuals and penalties for each kernel
+        for name in kernel_names:
+            self.add_input(f'residual_{name}', shape=n_samples)
+            self.add_input(f'smoothness_penalty_{name}', val=0.0)
+            self.add_input(f'decay_penalty_{name}', val=0.0)
+            self.add_input(f'ridge_penalty_{name}', val=0.0)
+        
+        # Output: total objective
+        self.add_output('objective', val=0.0)
+        
+        # Declare partials
+        for name in kernel_names:
+            self.declare_partials('objective', f'residual_{name}')
+            self.declare_partials('objective', f'smoothness_penalty_{name}', val=1.0)
+            self.declare_partials('objective', f'decay_penalty_{name}', val=1.0)
+            self.declare_partials('objective', f'ridge_penalty_{name}', val=1.0)
+    
+    def compute(self, inputs, outputs):
+        kernel_names = self.options['kernel_names']
+        
+        total_obj = 0.0
+        
+        for name in kernel_names:
+            # Sum of squared residuals
+            residual = inputs[f'residual_{name}']
+            total_obj += np.dot(residual, residual)
+            
+            # Add penalties
+            total_obj += inputs[f'smoothness_penalty_{name}']
+            total_obj += inputs[f'decay_penalty_{name}']
+            total_obj += inputs[f'ridge_penalty_{name}']
+        
+        outputs['objective'] = total_obj
+    
+    def compute_partials(self, inputs, partials):
+        kernel_names = self.options['kernel_names']
+        
+        for name in kernel_names:
+            # Gradient w.r.t. residual: 2 * residual
+            residual = inputs[f'residual_{name}']
+            partials['objective', f'residual_{name}'] = 2 * residual
+
+
+# ============================================================================
+# Main Optimization Problem Setup
+# ============================================================================
+
+class VoltterraIdentificationProblem(om.Group):
+    """
+    Complete Volterra identification problem as OpenMDAO group
+    """
+    
+    def initialize(self):
+        self.options.declare('A', types=np.ndarray)
+        self.options.declare('cl', types=np.ndarray)
+        self.options.declare('cm', types=np.ndarray)
+        self.options.declare('m', types=int, desc='Memory length per kernel order')
+        self.options.declare('use_laguerre', default=False, types=bool)
+        self.options.declare('n_basis', default=15, types=int)
+        self.options.declare('lambda_smooth', default=0.01)
+        self.options.declare('lambda_decay', default=0.1)
+        self.options.declare('lambda_ridge', default=0.001)
+        self.options.declare('decay_rate', default=5.0)
+        self.options.declare('alpha_laguerre', default=0.7)
+    
+    def setup(self):
+        A = self.options['A']
+        cl = self.options['cl']
+        cm = self.options['cm']
+        m = self.options['m']
+        use_laguerre = self.options['use_laguerre']
+        
+        n_samples, n_coeffs = A.shape
+        n_orders = n_coeffs // m
+        
+        kernel_names = ['cl', 'cm']
+        
+        # ==================================================================
+        # Design Variables
+        # ==================================================================
+        
+        if use_laguerre:
+            n_basis = self.options['n_basis']
+            alpha = self.options['alpha_laguerre']
+            
+            # Laguerre coefficients as design variables
+            for name in kernel_names:
+                self.add_subsystem(f'laguerre_{name}',
+                                  LaguerreTransformComp(kernel_name=name,
+                                                       m=m,
+                                                       n_orders=n_orders,
+                                                       n_basis=n_basis,
+                                                       alpha=alpha),
+                                  promotes_inputs=[(f'c_{name}', f'c_{name}')],
+                                  promotes_outputs=[(f'h_{name}', f'h_{name}')])
+        else:
+            # Direct kernel coefficients as design variables (via IndepVarComp)
+            ivcomp = self.add_subsystem('indeps', om.IndepVarComp(), promotes=['*'])
+            for name in kernel_names:
+                ivcomp.add_output(f'h_{name}', val=np.zeros(n_coeffs))
+        
+        # ==================================================================
+        # Residual Computation
+        # ==================================================================
+        
+        for name, y in zip(kernel_names, [cl, cm]):
+            self.add_subsystem(f'residual_{name}',
+                              VoltterraResidualComp(A=A, y=y, 
+                                                   kernel_name=name,
+                                                   n_coeffs=n_coeffs),
+                              promotes_inputs=[(f'h_{name}', f'h_{name}')],
+                              promotes_outputs=[(f'residual_{name}', f'residual_{name}')])
+        
+        # ==================================================================
+        # Regularization
+        # ==================================================================
+        
+        for name in kernel_names:
+            self.add_subsystem(f'regularization_{name}',
+                              RegularizationComp(kernel_name=name,
+                                                n_coeffs=n_coeffs,
+                                                m=m,
+                                                lambda_smooth=self.options['lambda_smooth'],
+                                                lambda_decay=self.options['lambda_decay'],
+                                                lambda_ridge=self.options['lambda_ridge'],
+                                                decay_rate=self.options['decay_rate']),
+                              promotes_inputs=[(f'h_{name}', f'h_{name}')],
+                              promotes_outputs=[(f'smoothness_penalty_{name}', f'smoothness_penalty_{name}'),
+                                              (f'decay_penalty_{name}', f'decay_penalty_{name}'),
+                                              (f'ridge_penalty_{name}', f'ridge_penalty_{name}')])
+        
+        # ==================================================================
+        # Objective Function
+        # ==================================================================
+        
+        self.add_subsystem('objective',
+                          ObjectiveComp(kernel_names=kernel_names,
+                                       n_samples=n_samples),
+                          promotes_inputs=[f'residual_{name}' for name in kernel_names] +
+                                        [f'{penalty}_{name}' 
+                                         for name in kernel_names 
+                                         for penalty in ['smoothness_penalty', 'decay_penalty', 'ridge_penalty']],
+                          promotes_outputs=['objective'])
+
+
+# ============================================================================
+# Setup and Run Functions
+# ============================================================================
+
+def run_volterra_identification(A, cl, cm, m, 
+                                use_laguerre=False,
+                                n_basis=6,
+                                lambda_smooth=0.01,
+                                lambda_decay=0.1,
+                                lambda_ridge=0.001,
+                                decay_rate=5.0,
+                                alpha_laguerre=0.7,
+                                optimizer='SLSQP',
+                                max_iter=4000,
+                                tol=1e-8,
+                                verbose=True):
+    """
+    Run Volterra kernel identification optimization
+    
+    Parameters:
+    -----------
+    A : ndarray, shape (ntsteps, 8m)
+        System matrix
+    cl, cm : ndarray, shape (ntsteps,)
+        Output vectors
+    m : int
+        Memory length per kernel order
+    use_laguerre : bool
+        If True, use Laguerre basis expansion
+    n_basis : int
+        Number of Laguerre basis functions (if use_laguerre=True)
+    lambda_smooth : float
+        Smoothness regularization weight
+    lambda_decay : float
+        Decay penalty weight
+    lambda_ridge : float
+        Ridge penalty weight
+    decay_rate : float
+        Exponential decay rate for penalty
+    alpha_laguerre : float
+        Laguerre pole parameter (0 < alpha < 1)
+    optimizer : str
+        Optimizer to use ('SLSQP', 'IPOPT', 'SNOPT', etc.)
+    max_iter : int
+        Maximum iterations
+    tol : float
+        Convergence tolerance
+    verbose : bool
+        Print optimization progress
+    
+    Returns:
+    --------
+    h_cl, h_cm : ndarray
+        Identified kernel coefficients
+    prob : om.Problem
+        OpenMDAO problem object (for inspection)
+    """
+    
+    # Create problem
+    prob = om.Problem()
+    
+    # Add the group
+    prob.model = VoltterraIdentificationProblem(
+        A=A, cl=cl, cm=cm, m=m,
+        use_laguerre=use_laguerre,
+        n_basis=n_basis,
+        lambda_smooth=lambda_smooth,
+        lambda_decay=lambda_decay,
+        lambda_ridge=lambda_ridge,
+        decay_rate=decay_rate,
+        alpha_laguerre=alpha_laguerre
+    )
+    
+    # Setup driver
+    if optimizer == 'SLSQP':
+        prob.driver = om.ScipyOptimizeDriver()
+        prob.driver.options['optimizer'] = 'SLSQP'
+        prob.driver.options['maxiter'] = max_iter
+        prob.driver.options['tol'] = tol
+    elif optimizer == 'IPOPT':
+        prob.driver = om.pyOptSparseDriver()
+        prob.driver.options['optimizer'] = 'IPOPT'
+        prob.driver.opt_settings['max_iter'] = max_iter
+        prob.driver.opt_settings['tol'] = tol
+    else:
+        raise ValueError(f"Optimizer {optimizer} not supported")
+    
+    # if verbose:
+    #     prob.driver.options['disp'] = True
+    
+    # Add design variables
+    n_coeffs = A.shape[1]
+    
+    if use_laguerre:
+        n_laguerre_coeffs = (n_coeffs // m) * n_basis
+        prob.model.add_design_var('c_cl', lower=-45.0, upper=45.0)
+        prob.model.add_design_var('c_cm', lower=-45.0, upper=45.0)
+    else:
+        prob.model.add_design_var('h_cl', lower=-45.0, upper=45.0)
+        prob.model.add_design_var('h_cm', lower=-45.0, upper=45.0)
+    
+    # Add objective
+    prob.model.add_objective('objective')
+    
+    # Setup and run
+    prob.setup()
+    
+    # Set initial guess (small random values)
+    np.random.seed(42)
+    if use_laguerre:
+        prob.set_val('c_cl', 0.01 * np.random.randn(n_laguerre_coeffs))
+        prob.set_val('c_cm', 0.01 * np.random.randn(n_laguerre_coeffs))
+    else:
+        prob.set_val('h_cl', 0.01 * np.random.randn(n_coeffs))
+        prob.set_val('h_cm', 0.01 * np.random.randn(n_coeffs))
+    
+    # Run optimization
+    prob.run_driver()
+    
+    # Extract results
+    h_cl = prob.get_val('h_cl')
+    h_cm = prob.get_val('h_cm')
+    
+    if verbose:
+        print("\n" + "="*70)
+        print("OPTIMIZATION RESULTS")
+        print("="*70)
+        print(f"Final objective value: {prob.get_val('objective')[0]:.6e}")
+        print(f"h_cl norm: {np.linalg.norm(h_cl):.6e}")
+        print(f"h_cm norm: {np.linalg.norm(h_cm):.6e}")
+        
+        # Compute final residuals
+        residual_cl = A @ h_cl - cl
+        residual_cm = A @ h_cm - cm
+        nmse_cl = np.mean(residual_cl**2) / np.var(cl)
+        nmse_cm = np.mean(residual_cm**2) / np.var(cm)
+        
+        print(f"NMSE (cl): {nmse_cl:.6e}")
+        print(f"NMSE (cm): {nmse_cm:.6e}")
+    
+    return h_cl, h_cm, prob
+
+
+# ============================================================================
+# Example Usage
+# ============================================================================
+
+# if __name__ == "__main__":
+    
+#     # Example: Create synthetic data
+#     print("Creating synthetic test data...")
+    
+#     ntsteps = 500
+#     m = 20  # Memory per order
+#     n_orders = 8  # You mentioned 8m total coefficients
+#     n_coeffs = n_orders * m  # 8m total
+    
+#     # Random system matrix
+#     np.random.seed(42)
+#     A = np.random.randn(ntsteps, n_coeffs) * 0.1
+    
+#     # True kernels (with decay)
+#     h_true_cl = np.zeros(n_coeffs)
+#     h_true_cm = np.zeros(n_coeffs)
+    
+#     for order in range(n_orders):
+#         decay = np.exp(-2 * np.linspace(0, 1, m))
+#         h_true_cl[order*m:(order+1)*m] = (order + 1) * decay * 0.1
+#         h_true_cm[order*m:(order+1)*m] = (order + 1) * decay * 0.15
+    
+#     # Generate outputs with noise
+#     cl = A @ h_true_cl + 0.01 * np.random.randn(ntsteps)
+#     cm = A @ h_true_cm + 0.01 * np.random.randn(ntsteps)
+    
+#     print(f"Data shape: A={A.shape}, cl={cl.shape}, cm={cm.shape}")
+#     print(f"Memory length m={m}, Total coefficients={n_coeffs}")
+    
+#     # ========================================================================
+#     # Run identification - Direct coefficients
+#     # ========================================================================
+    
+#     print("\n" + "="*70)
+#     print("RUNNING OPTIMIZATION: Direct Coefficients")
+#     print("="*70)
+    
+#     h_cl_direct, h_cm_direct, prob_direct = run_volterra_identification(
+#         A, cl, cm, m,
+#         use_laguerre=False,
+#         lambda_smooth=0.01,
+#         lambda_decay=0.1,
+#         lambda_ridge=0.001,
+#         decay_rate=5.0,
+#         optimizer='SLSQP',
+#         max_iter=500,
+#         verbose=True
+#     )
+    
+#     # ========================================================================
+#     # Run identification - Laguerre basis
+#     # ========================================================================
+    
+#     print("\n" + "="*70)
+#     print("RUNNING OPTIMIZATION: Laguerre Basis")
+#     print("="*70)
+    
+#     h_cl_laguerre, h_cm_laguerre, prob_laguerre = run_volterra_identification(
+#         A, cl, cm, m,
+#         use_laguerre=True,
+#         n_basis=8,  # Fewer parameters than direct (8 vs 20 per order)
+#         alpha_laguerre=0.7,
+#         lambda_smooth=0.005,  # Less smoothing needed with Laguerre
+#         lambda_decay=0.05,
+#         lambda_ridge=0.01,
+#         optimizer='SLSQP',
+#         max_iter=500,
+#         verbose=True
+#     )
+    
+#     # ========================================================================
+#     # Compare results
+#     # ========================================================================
+    
+#     import matplotlib.pyplot as plt
+    
+#     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+#     # Plot kernels for first two orders
+#     for order in range(min(2, n_orders)):
+#         # CL kernels
+#         axes[0, order].plot(h_true_cl[order*m:(order+1)*m], 
+#                            'k-', linewidth=2, label='True')
+#         axes[0, order].plot(h_cl_direct[order*m:(order+1)*m], 
+#                            'b--', linewidth=2, label='Direct')
+#         axes[0, order].plot(h_cl_laguerre[order*m:(order+1)*m], 
+#                            'r:', linewidth=2, label='Laguerre')
+#         axes[0, order].set_xlabel('Lag index')
+#         axes[0, order].set_ylabel('Coefficient value')
+#         axes[0, order].set_title(f'CL Kernel - Order {order}')
+#         axes[0, order].legend()
+#         axes[0, order].grid(True, alpha=0.3)
+        
+#         # CM kernels
+#         axes[1, order].plot(h_true_cm[order*m:(order+1)*m], 
+#                            'k-', linewidth=2, label='True')
+#         axes[1, order].plot(h_cm_direct[order*m:(order+1)*m], 
+#                            'b--', linewidth=2, label='Direct')
+#         axes[1, order].plot(h_cm_laguerre[order*m:(order+1)*m], 
+#                            'r:', linewidth=2, label='Laguerre')
+#         axes[1, order].set_xlabel('Lag index')
+#         axes[1, order].set_ylabel('Coefficient value')
+#         axes[1, order].set_title(f'CM Kernel - Order {order}')
+#         axes[1, order].legend()
+#         axes[1, order].grid(True, alpha=0.3)
+    
+#     plt.tight_layout()
+#     plt.savefig('volterra_openmdao_results.png', dpi=150)
+#     plt.show()
+    
+#     print("\n" + "="*70)
+#     print("COMPARISON COMPLETE")
+#     print("="*70)
+
+import csv 
+
+def read_csv(filename):
+    with open(filename, newline='') as f_input:
+        next(f_input)
+        next(f_input)
+        return [list(map(float, row)) for row in csv.reader(f_input)]
+
+
+def generate_schroeder_multisine(freqs, dt, duration, amp=1.0):
+    t = np.arange(0, duration, dt)
+    N = len(freqs)
+    # Schroeder Phase Formula: phi_k = -k*(k-1)*pi / N
+    phases = [-k * (k - 1) * np.pi / N for k in range(  1, N + 1)]
+    
+    signal = np.zeros_like(t)
+    for i, f in enumerate(freqs):
+        signal += amp * np.sin(2 * np.pi * f * t + phases[i])
+    
+    # Normalize to keep within original amplitude constraints
+    # signal = signal / np.max(np.abs(signal)) * amp
+    return t, signal
+
+
+
+def plot_aero_responses(h_cl_theta, h_cl_zdot, h_cl_thetadot, 
+                        h_cm_theta, h_cm_zdot, h_cm_thetadot, 
+                        omega, nt_int, dt):
+    """
+    Calculates and plots the aerodynamic lift (Cl) and moment (Cm) responses 
+    for pitch, heave, and theta-dot components based on a sinusoidal AoA.
+    """
+    
+    # --- 1. Define Time and Input Signal ---
+    time_test = dt * np.arange(nt_int)
+    # Sinusoidal Angle of Attack (1 degree amplitude)
+    aoa = np.deg2rad(1.) * np.sin(omega * time_test)
+    aoa_2 = np.deg2rad(1.) * np.sin(2 * omega * time_test)
+    aoa_3 = np.deg2rad(1.) * np.sin(3 * omega * time_test)
+
+    # --- 2. Calculate Responses ---
+    # Assuming 'response' is a pre-defined function in your workspace
+    cl_pitch    = response(h_cl_theta, aoa, nt_int)
+    cl_heave    = response(h_cl_zdot, aoa, nt_int)
+    cl_thetadot = response(h_cl_thetadot, aoa, nt_int)
+
+    cm_pitch    = response(h_cm_theta, aoa, nt_int)
+    cm_heave    = response(h_cm_zdot, aoa, nt_int)
+    cm_thetadot = response(h_cm_thetadot, aoa, nt_int)
+
+    cl_pitch_2    = response(h_cl_theta, aoa_2, nt_int)
+    cm_pitch_2    = response(h_cm_theta, aoa_2, nt_int)
+
+    cl_pitch_3    = response(h_cl_theta, aoa_3, nt_int)
+    cm_pitch_3    = response(h_cm_theta, aoa_3, nt_int)
+
+    # --- 3. Visualization ---
+    fig, ax = plt.subplots(3, 1, figsize=(10, 8))
+
+    # Subplot 1: Input AoA
+    ax[0].plot(time_test, aoa, label="AOA")
+    ax[0].set_xlabel(r'$\tau\,[\,]$')
+    ax[0].set_ylabel(r'$w\, [\,]$')
+    ax[0].legend()
+    ax[0].grid(True)
+
+    # Subplot 2: Cl Components
+    ax[1].plot(time_test, cl_pitch, label="Cl PITCH")
+    ax[1].plot(time_test, cl_pitch_2, label="Cl PITCH 2")
+    ax[1].plot(time_test, cl_pitch_3, label="Cl PITCH 3")
+    ax[1].plot(time_test, cl_heave, label="Cl HEAVE")
+    ax[1].plot(time_test, cl_thetadot, label="Cl Thetadot")
+    ax[1].set_xlabel(r'$\tau\,[\,]$')
+    ax[1].set_ylabel(r'$Cl\, [\,]$')
+    ax[1].legend()
+    ax[1].grid(True)
+
+    # Subplot 3: Cm Components
+    ax[2].plot(time_test, cm_pitch, label="Cm PITCH")
+    ax[2].plot(time_test, cm_pitch_2, label="Cm PITCH 2")
+    ax[2].plot(time_test, cm_pitch_3, label="Cm PITCH 3")
+    ax[2].plot(time_test, cm_heave, label="Cm HEAVE")
+    ax[2].plot(time_test, cm_thetadot, label="Cm Thetadot")
+    ax[2].set_xlabel(r'$\tau\,[\,]$')
+    ax[2].set_ylabel(r'$Cm\, [\,]$')
+    ax[2].legend()
+    ax[2].grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Optional: Return data for further analysis
+    return time_test, aoa
+    
+
+def response(kernels, aoa, nt):
+    ndof = kernels.shape[0] 
+    
+    AA = np.diag(np.ones(ndof-1),-1)
+    BB = np.zeros((ndof))
+    BB[0] = 1.
+    CC = kernels
+    
+    q = np.zeros((ndof, nt))
+    cn = np.zeros(nt)
+    
+    for it in range(1,nt):
+        q[:,it] = AA@q[:,it-1] + BB*aoa[it] 
+        cn[it] = CC@q[:,it]    
+    
+    return cn 
+    
+
+Mach = 0.8      # freestream Mach number
+AOA = 4    # wind off angle-of-attack [deg]
+
+home_pitch = "/Users/marcello/Documents/Ael/bscw/Data_from_Michael/AOA0%s" % AOA
+# home_pitch = "/Users/marcello/Documents/Ael/bscw/Data_from_Michael/AOA0%s_fine" % AOA
+
+# FINE 3 deg: 10900, 4 deg: 9000. 5 deg: 3150
+# MEDIUM  5 deg: 1500. #4 deg: 7800. #3 deg: 10600. #2 deg: 9350. # 1 deg: 9350. #0 deg: 9400. 
+
+# MEDIUM: 0DEG 8600 1DEG 8400 2deg 8900  3deg 10300 
+
+v_inf = 131.41  # freestream velocity from CFD simulation [m/s]
+rho_inf = 0.832 # freestream density from CFD simulation [kg/m^3]
+q_inf = 0.5*rho_inf*v_inf**2 
+delta_t = 0.0002 # transient time step [seconds]
+chord = 0.41
+
+dtau = delta_t * v_inf /(2 * chord)
+resample_steps = 1 #4 #4 #10
+m = 56 #320 #320 #240 #160 #80 #80
+
+print("Model memory: ", resample_steps * m * dtau, " (reduced time units)" )
+
+gen_static_forces = np.loadtxt("/Users/marcello/Documents/Ael/bscw/Data_from_Michael/gen_static_force_AOA%s_q150psf_SST_med_train.txt" % AOA) # generalised static force normalised by q_inf
+
+# print(gen_static_forces)
+
+
+# ======== TRAINING SIGNAL 
+# medium mesh 
+gen_disp = np.loadtxt("/Users/marcello/Documents/Ael/bscw/Data_from_Michael/input_AOA%s_q150psf_SST_med_train.txt"%AOA) # INPUTS: generalized structural displacements
+gen_force = 1.0*np.loadtxt("/Users/marcello/Documents/Ael/bscw/Data_from_Michael/output_AOA%s_q150psf_SST_med_train.txt"%AOA) # OUTPUT: generalised dynamic force normalised by q_inf
+
+# fine mesh 
+# gen_disp = np.loadtxt("/Users/marcello/Documents/Ael/bscw/Data_from_Michael/input_AOA%s_q150psf_SST_fine_train.txt"%AOA) # INPUTS: generalized structural displacements
+# gen_force = 1.0*np.loadtxt("/Users/marcello/Documents/Ael/bscw/Data_from_Michael/output_AOA%s_q150psf_SST_fine_train.txt"%AOA) # OUTPUT: generalised dynamic force normalised by q_inf
+
+
+
+pitch_input           = 1e0*gen_disp[1,:]*29.85872 /180*np.pi # pitch input if you want to convert to deg
+pitch_input_resampled = 1e0*gen_disp[1,::resample_steps]*29.85872 /180*np.pi # pitch input if you want to convert to deg
+
+ntsteps            = len(pitch_input)
+ntsteps_resampled  = len(pitch_input_resampled)
+
+time_vector           = np.linspace(0.,ntsteps*delta_t, ntsteps)
+time_vector_resampled = time_vector[::resample_steps] #np.linspace(0.,resample_steps*delta_t*ntsteps_resampled,ntsteps_resampled)
+
+tau_vector = time_vector*2*v_inf/chord
+tau_vector_resampled = time_vector_resampled*2*v_inf/chord
+
+heave_input_int = - gen_disp[0,:]*0.106654261 # heave input if you want to convert to m
+heave_input_grad = np.gradient(heave_input_int,time_vector)/v_inf
+heave_input_grad_resampled = heave_input_grad[::resample_steps]
+
+pitch_input_grad = np.gradient(gen_disp[1,:]*29.85872 /180*np.pi,time_vector)/v_inf
+pitch_input_grad_resampled = pitch_input_grad[::resample_steps]
+
+cl_output = gen_force[0,:] / 0.106654 / (chord*chord*2)
+cl_output_resampled = gen_force[0,::resample_steps] / 0.106654 / (chord*chord*2)
+
+cm_output = gen_force[1,:]/ (29.86*np.pi/180) / (chord*chord*chord*2)
+cm_output_resampled = gen_force[1,::resample_steps] / (29.86*np.pi/180) / (chord*chord*chord*2)
+
+cm_0 = gen_static_forces[1] / (29.86*np.pi/180) / (chord*chord*chord*2)
+cl_0 = gen_static_forces[0] / 0.106654 / (chord*chord*2)
+
+print("Cm_0 and Cl_0", cm_0, cl_0)
+print("NTSTEPS = ",ntsteps)
+print("NTSTEPS_RESAMPLED = ",ntsteps_resampled)
+
+
+# DETREND ---------------------------
+
+pitch_avg = np.average(pitch_input)
+heave_avg = np.average(heave_input_grad)
+
+pitch_input -= pitch_avg
+heave_input_grad -= heave_avg
+
+cl0 = np.average(cl_output)
+cm0 = np.average(cm_output)
+
+cl_output -= cl0
+cm_output -= cm0 
+
+# ======== TEST SIGNAL 
+gen_disp_test = np.loadtxt("/Users/marcello/Documents/Ael/bscw/Data_from_Michael/input_AOA%s_q150psf_SST_med_test.txt"%AOA) # INPUTS: generalized structural displacements
+gen_force_test = 1.0*np.loadtxt("/Users/marcello/Documents/Ael/bscw/Data_from_Michael/output_AOA%s_q150psf_SST_med_test.txt"%AOA) # OUTPUT: generalised dynamic force normalised by q_inf
+
+
+ntsteps_test            = len(pitch_input)
+print("TEST", ntsteps_test)
+
+pitch_input_test           = 1e0*gen_disp_test[1,:]*29.85872 /180*np.pi # pitch input if you want to convert to deg
+
+heave_input_int = - gen_disp_test[0,:]*0.106654261 # heave input if you want to convert to m
+heave_input_grad_test = np.gradient(heave_input_int,time_vector)/v_inf
+
+cl_output_test = gen_force_test[0,:] / 0.106654 / (chord*chord*2)
+cm_output_test = gen_force_test[1,:]/ (29.86*np.pi/180) / (chord*chord*chord*2)
+
+# de trend
+
+pitch_avg = np.average(pitch_input_test)
+heave_avg = np.average(heave_input_grad_test)
+
+pitch_input_test -= pitch_avg
+heave_input_grad_test -= heave_avg
+
+cl0 = np.average(cl_output_test)
+cm0 = np.average(cm_output_test)
+
+cl_output_test -= cl0
+cm_output_test -= cm0 
+
+# ========
+
+fig, ax = plt.subplots(4, 2, figsize=(10, 10))
+
+plt.subplot(4, 2, 1)
+
+plt.plot(tau_vector,cm_output,"-",label=r"$C_m$")
+plt.xlabel(r'$\tau\,[\,]$')
+plt.ylabel(r'$C_m\, [\,]$')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(4, 2, 3)
+
+plt.plot(tau_vector,cl_output,"-",label=r"$C_l$")
+plt.xlabel(r'$\tau\,[\,]$')
+plt.ylabel(r'$C_l\, [\,]$')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(4, 2, 5)
+
+plt.plot(time_vector, heave_input_grad*180/np.pi,label="heave input")
+plt.xlabel(r'$t\,[s]$')
+plt.ylabel(r'$\dot{h}/V \,[RAD]$')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(4, 2, 7)
+
+plt.plot(time_vector,pitch_input*180/np.pi,label="pitch input")
+plt.xlabel(r'$t\,[s]$')
+plt.ylabel(r'$\theta [DEG]$')
+plt.legend()
+plt.grid(True)
+
+# TEST
+
+plt.subplot(4, 2, 2)
+
+plt.plot(tau_vector,cm_output_test,"-",label=r"$C_m$")
+plt.xlabel(r'$\tau\,[\,]$')
+plt.ylabel(r'$TEST C_m\, [\,]$')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(4, 2, 4)
+
+plt.plot(tau_vector,cl_output_test,"-",label=r"$C_l$")
+plt.xlabel(r'$\tau\,[\,]$')
+plt.ylabel(r'$TEST C_l\, [\,]$')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(4, 2, 6)
+
+plt.plot(time_vector, heave_input_grad_test*180/np.pi,label="heave input")
+plt.xlabel(r'$t\,[s]$')
+plt.ylabel(r'$TEST \dot{h}/V \,[RAD]$')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(4, 2, 8)
+
+plt.plot(time_vector,pitch_input_test*180/np.pi,label="pitch input")
+plt.xlabel(r'$t\,[s]$')
+plt.ylabel(r'$TEST \theta [DEG]$')
+plt.legend()
+plt.grid(True)
+
+
+plt.tight_layout()
+plt.show()
+# =========
+
+A_pitch = np.zeros((ntsteps,m))
+A_thetadot = np.zeros((ntsteps,m))
+A_zdot = np.zeros((ntsteps,m))
+
+norm_factor = 20. 
+
+# ---------------------------
+
+A_pitch = np.zeros((ntsteps,m))
+A_thetadot = np.zeros((ntsteps,m))
+A_zdot = np.zeros((ntsteps,m))
+
+for icolumn in range(m):
+    A_pitch[icolumn:,icolumn] = pitch_input[:ntsteps-icolumn]
+    A_zdot[icolumn:,icolumn] = heave_input_grad[:ntsteps-icolumn]
+
+A = np.hstack( (A_pitch, A_zdot))
+
+A_pitch2 = A_pitch*A_pitch
+# A_pitch2 = np.abs(A_pitch)*A_pitch
+A_thetadot2 = A_thetadot*A_thetadot
+A_zdot2 = A_zdot*A_zdot
+# A_zdot2 = np.abs(A_zdot)*A_zdot
+A_pitch_zdot = A_pitch*A_zdot
+A_thetadot_zdot = A_thetadot*A_zdot
+
+A2 = np.hstack( (A_pitch2,A_zdot2,A_pitch_zdot))
+
+# third order
+A_pitch3 = A_pitch*A_pitch*A_pitch
+A_zdot3 = A_zdot*A_zdot*A_zdot
+A_pitch_zdot2 = A_pitch*A_zdot2
+A_zdot_pitch2 = A_zdot*A_pitch2
+
+A3 = np.hstack( (A_pitch3,A_zdot3,A_pitch_zdot2, A_zdot_pitch2))
+
+# ID
+A_123 = np.hstack( (A, A2, A3))
+
+h1, i1 = stlsq_min_nnz(A_123, cl_output, threshold=0.005, min_nnz=20)
+print(f"  R²={i1['r2']:.4f}  nnz={i1['nnz']}")
+
+h2, i2 = stlsq_relative(A_123, cl_output, rel_threshold=0.005)
+print(f"  R²={i2['r2']:.4f}  nnz={i2['nnz']}")
+
+print("\n--- OMP n_nonzero=30 ---")
+h3, i3 = solve_omp(A_123, cl_output, n_nonzero=30)
+
+# CM
+
+h1_cm, i1 = stlsq_min_nnz(A_123, cm_output, threshold=0.005, min_nnz=20)
+print(f"  R²={i1['r2']:.4f}  nnz={i1['nnz']}")
+
+h2_cm, i2 = stlsq_relative(A_123, cm_output, rel_threshold=0.005)
+print(f"  R²={i2['r2']:.4f}  nnz={i2['nnz']}")
+
+print("\n--- OMP n_nonzero=30 ---")
+h3_cm, i3 = solve_omp(A_123, cm_output, n_nonzero=30)
+
+plt.figure(figsize=(12, 5))
+
+# plt.plot(h1,'r.-')
+# plt.plot(h2,'g.-')
+plt.plot(h3,'k.-')
+plt.xlabel('Lag index')
+plt.ylabel('Coefficient')
+plt.grid(True)
+
+plt.show()
+
+cl_h1 = A_123@h1 
+cl_h2 = A_123@h2 
+cl_h3 = A_123@h3 
+
+cm_h1 = A_123@h1_cm 
+cm_h2 = A_123@h2_cm 
+cm_h3 = A_123@h3_cm 
+
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+plt.plot(cl_output, 'b-', linewidth=2)
+plt.plot(cl_h1, 'r-', linewidth=1)
+plt.plot(cl_h2, 'g-', linewidth=1)
+plt.plot(cl_h3, 'k-', linewidth=1)
+plt.ylim([-0.25, 0.25])
+plt.xlabel(f't')
+plt.ylabel(f'C_l')
+plt.grid(True)
+
+plt.subplot(1, 2, 2)
+plt.plot(cm_output, 'b-', linewidth=2)
+plt.plot(cm_h1, 'r-', linewidth=1)
+plt.plot(cm_h2, 'g-', linewidth=1)
+plt.plot(cm_h3, 'k-', linewidth=1)
+plt.ylim([-0.1, 0.1])
+plt.xlabel(f't')
+plt.ylabel(f'C_l')
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# ==============
+# TEST 
+
+A_pitch = np.zeros((ntsteps,m))
+A_zdot = np.zeros((ntsteps,m))
+
+for icolumn in range(m):
+    A_pitch[icolumn:,icolumn] = pitch_input_test[:ntsteps-icolumn]
+    A_zdot[icolumn:,icolumn] = heave_input_grad_test[:ntsteps-icolumn]
+
+A = np.hstack( (A_pitch, A_zdot))
+
+A_pitch2 = A_pitch*A_pitch
+A_zdot2 = A_zdot*A_zdot
+A_pitch_zdot = A_pitch*A_zdot
+
+A2 = np.hstack( (A_pitch2,A_zdot2,A_pitch_zdot))
+
+# third order
+A_pitch3 = A_pitch*A_pitch*A_pitch
+A_zdot3 = A_zdot*A_zdot*A_zdot
+A_pitch_zdot2 = A_pitch*A_zdot2
+A_zdot_pitch2 = A_zdot*A_pitch2
+
+A3 = np.hstack( (A_pitch3,A_zdot3,A_pitch_zdot2, A_zdot_pitch2))
+
+A_123_test = np.hstack( (A, A2, A3))
+
+cl_h1 = A_123_test@h1 
+cl_h2 = A_123_test@h2 
+cl_h3 = A_123_test@h3 
+
+cm_h1 = A_123_test@h1_cm 
+cm_h2 = A_123_test@h2_cm 
+cm_h3 = A_123_test@h3_cm 
+
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+plt.plot(cl_output_test, 'b-', linewidth=2)
+plt.plot(cl_h1, 'r-', linewidth=1)
+plt.plot(cl_h2, 'g-', linewidth=1)
+plt.plot(cl_h3, 'k-', linewidth=1)
+plt.ylim([-0.25, 0.25])
+plt.xlabel(f't')
+plt.ylabel(f'C_l')
+plt.grid(True)
+
+plt.subplot(1, 2, 2)
+plt.plot(cm_output_test, 'b-', linewidth=2)
+plt.plot(cm_h1, 'r-', linewidth=1)
+plt.plot(cm_h2, 'g-', linewidth=1)
+plt.plot(cm_h3, 'k-', linewidth=1)
+plt.ylim([-0.1, 0.1])
+plt.xlabel(f't')
+plt.ylabel(f'C_l')
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
